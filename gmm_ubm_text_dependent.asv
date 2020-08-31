@@ -1,0 +1,480 @@
+%addpath lab_library/;
+%Add the directory and its subdirectories 
+%addpath(genpath('lab_library/'))
+% clc % clear command window
+
+function [ads] = gmm_ubm_text_dependent() 
+%addpath(genpath('speech_commands_data/'));
+    %clc;
+    
+    file_location = fullfile("speaker_data_data_same", "stop");
+    ads = audioDatastore(file_location, 'IncludeSubfolders',true,'LabelSource','folderNames', 'FileExtensions','.wav');
+    labelCount = countEachLabel(ads);
+    
+    indexes = [95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5];
+    [speakersToTrain, speakersToTest, speakersToEval] = data_partition(x);
+    
+    %speakersToTest = categorical(["speaker_1", "speaker_2", "speaker_3", "speaker_4", ...
+    %    "speaker_5", "speaker_6", "speaker_7", "speaker_8", "speaker_9", "speaker_10"]);
+    
+    speakersToTest = categorical(["speaker_10", "speaker_20", "speaker_30", "speaker_40", ...
+        "speaker_50", "speaker_60", "speaker_70", "speaker_80", "speaker_90", "speaker_100"]);
+
+    adsTrain = subset(ads,~ismember(ads.Labels,speakersToTest));
+    adsEnrollAndVerify = subset(ads,ismember(ads.Labels,speakersToTest));
+    adsTrain = shuffle(adsTrain);
+    adsEnrollAndVerify = shuffle(adsEnrollAndVerify);
+    countEachLabel(adsTrain)
+    countEachLabel(adsEnrollAndVerify)
+    
+    numFilesPerSpeakerForEnrollment = 4;
+    [adsEnroll,adsVerify] = splitEachLabel(adsEnrollAndVerify,numFilesPerSpeakerForEnrollment);
+    [adsTest, ~] = splitEachLabel(adsVerify,1);
+    disp("Test : ");
+    disp(adsTest);
+    adsTrainUBM = adsTrain;
+
+
+end
+
+
+function [] = evaluate_model(adsTrainUBM,adsEnroll, adsTest) 
+
+    
+    %Read from the training datastore and listen to a file. Reset the datastore.
+    [audioData,audioInfo] = read(adsTrainUBM);
+    fs = audioInfo.SampleRate;
+    t = (0:size(audioData,1)-1)/fs;
+    sound(audioData,fs)
+    figure;
+    plot(t,audioData)
+    xlabel('Time (s)')
+    ylabel('Amplitude')
+    axis([0 t(end) -1 1])
+    title('Sample Utterance from Training Set')
+    reset(adsTrainUBM)
+    
+    % Features extractions
+    numCoeffs = 20;
+    deltaWindowLength = 9;
+    windowDuration = 0.025;
+    hopDuration = 0.01;
+    afe = feature_Extraction(fs, numCoeffs, deltaWindowLength, windowDuration, hopDuration);
+    
+    % Normalize the audio.
+    audioData = audioData./max(abs(audioData));
+    idx = detectSpeech(audioData,fs);
+    audioData = audioData(idx(1,1):idx(1,2));
+    features = extract(afe,audioData);
+    [numHops, numFeatures] = size(features)
+    
+    % Extract all Features 
+    [allFeatures, normFactors, numPar] = global_Feature_Normalization_Factors(adsTrainUBM, afe);
+    [ubm, numComponents]  = universal_Background_Model(adsTrainUBM, numFeatures, numPar, afe, normFactors);
+    [enrolledGMMs, ~, ~]  = enroll(adsEnroll, numFeatures, numComponents, ubm, afe,normFactors);
+    [llr, numSpeakers, speakers]  = speaker_False_Rejection_Rate(enrolledGMMs, adsEnroll, adsTest, afe, normFactors, ubm);
+    
+
+end
+
+
+%%
+function [llr, numSpeakers, speakers]  = speaker_False_Rejection_Rate(enrolledGMMs, adsEnroll, adsTest, afe, normFactors, ubm)
+    speakers = unique(adsEnroll.Labels);
+    numSpeakers = numel(speakers);
+    llr = cell(numSpeakers,1);
+    tic
+    parfor speakerIdx = 1:numSpeakers
+        localGMM = enrolledGMMs.(string(speakers(speakerIdx))); 
+        adsTestSubset = subset(adsTest, adsTest.Labels==speakers(speakerIdx));
+        llrPerSpeaker = zeros(numel(adsTestSubset.Files),1);
+        for fileIdx = 1:numel(adsTestSubset.Files)
+            audioData = read(adsTestSubset);
+            [x,numFrames] = helperFeatureExtraction(audioData,afe,normFactors);
+
+            logLikelihood = helperGMMLogLikelihood(x,localGMM);
+            Lspeaker = helperLogSumExp(logLikelihood);
+
+            logLikelihood = helperGMMLogLikelihood(x,ubm);
+            Lubm = helperLogSumExp(logLikelihood);
+
+            llrPerSpeaker(fileIdx) = mean(movmedian(Lspeaker - Lubm,3));
+        end
+        llr{speakerIdx} = llrPerSpeaker;
+    end
+    fprintf('False rejection rate computed in %0.2f seconds.\n',toc)
+    disp(" --------------- Avant ------------------------ llr : ");
+    disp(llr);
+    %Plot the false rejection rate as a function of the threshold.
+    llr = cat(1,llr{:});
+    disp("llr *************** After ********************* llr : ");
+    disp(llr);
+
+    thresholds = -1.0:0.01:3.5;
+    FRR = mean(llr<thresholds);
+    disp("len(llr) ");
+    disp(length(llr))
+    disp("len(thresholds) ");
+    disp(length(thresholds))
+    disp("len(FRR) ");
+    disp(length(FRR))
+    figure;
+    plot(thresholds,FRR*100)
+    title('False Rejection Rate (FRR)')
+    xlabel('Threshold')
+    ylabel('Incorrectly Rejected (%)')
+    grid on
+    
+
+end
+%%
+
+
+%%
+function [enrolledGMMs, numSpeakers, speakers]  = enroll(adsEnroll, numFeatures, numComponents, ubm, afe,normFactors)
+    relevanceFactor = 16;
+    speakers = unique(adsEnroll.Labels);
+    numSpeakers = numel(speakers);
+    gmmCellArray = cell(numSpeakers,1);
+    
+    tic
+    parfor ii = 1:numSpeakers
+        % Subset the datastore to the speaker you are adapting.
+        adsTrainSubset = subset(adsEnroll,adsEnroll.Labels==speakers(ii));
+        N = zeros(1,numComponents);
+        F = zeros(numFeatures,numComponents);
+        S = zeros(numFeatures,numComponents);
+        while hasdata(adsTrainSubset)
+            audioData = read(adsTrainSubset);
+            features = helperFeatureExtraction(audioData,afe,normFactors);
+            [n,f,s,l] = helperExpectation(features,ubm);
+            N = N + n;
+            F = F + f;
+            S = S + s;
+        end
+
+        % Determine the maximum likelihood
+        gmm = helperMaximization(N,F,S);
+        
+        % Determine adaption coefficient
+        alpha = N ./ (N + relevanceFactor);
+        
+        % Adapt the means
+        gmm.mu = alpha.*gmm.mu + (1-alpha).*ubm.mu;
+
+        % Adapt the variances
+        gmm.sigma = alpha.*(S./N) + (1-alpha).*(ubm.sigma + ubm.mu.^2) - gmm.mu.^2;
+        gmm.sigma = max(gmm.sigma,eps);
+
+        % Adapt the weights
+        gmm.ComponentProportion = alpha.*(N/sum(N)) + (1-alpha).*ubm.ComponentProportion;
+        gmm.ComponentProportion = gmm.ComponentProportion./sum(gmm.ComponentProportion);
+
+        gmmCellArray{ii} = gmm;
+    end
+    fprintf('Enrollment completed in %0.2f seconds.\n',toc)
+    %For bookkeeping purposes, convert the cell array of GMMs to a struct, 
+    % with the fields being the speaker IDs and the values being the GMM structs.
+    for i = 1:numel(gmmCellArray)
+        enrolledGMMs.(string(speakers(i))) = gmmCellArray{i};
+    end
+
+end
+%%
+
+%%
+function [ubm, numComponents]  = universal_Background_Model(adsTrainUBM, numFeatures, numPar, afe, normFactors)
+    % Initialize GMM
+    numComponents =32;
+    alpha = ones(1,numComponents)/numComponents;
+
+    mu = randn(numFeatures,numComponents);
+    sigma = rand(numFeatures,numComponents);
+    ubm = struct('ComponentProportion',alpha,'mu',mu,'sigma',sigma);
+
+    % Train UBM Using Expectation-Maximization
+    maxIter = 20;
+    targetLogLikelihood = 0;
+    tol = 0.005;
+    pastL = -inf; % initialization of previous log-likelihood
+
+    tic
+    for iter = 1:maxIter
+
+        % EXPECTATION
+        N = zeros(1,numComponents);
+        F = zeros(numFeatures,numComponents);
+        S = zeros(numFeatures,numComponents);
+        L = 0;
+        for ii = 1:numPar
+            adsPart = partition(adsTrainUBM,numPar,ii);
+            while hasdata(adsPart)
+                audioData = read(adsPart);
+
+                % Extract features
+                features = helperFeatureExtraction(audioData,afe,normFactors);
+
+                % Compute a posteriori log-likelihood
+                logLikelihood = helperGMMLogLikelihood(features,ubm);
+
+                % Compute a posteriori normalized probability
+                logLikelihoodSum = helperLogSumExp(logLikelihood);
+                gamma = exp(logLikelihood - logLikelihoodSum)';
+
+                % Compute Baum-Welch statistics
+                n = sum(gamma,1);
+                f = features * gamma;
+                s = (features.*features) * gamma;
+
+                % Update the sufficient statistics over utterances
+                N = N + n;
+                F = F + f;
+                S = S + s;
+
+                % Update the log-likelihood
+                L = L + sum(logLikelihoodSum);
+            end
+        end
+
+        % Print current log-likelihood and stop if it meets criteria.
+        L = L/numel(adsTrainUBM.Files);
+        fprintf('\tIteration %d, Log-likelihood = %0.3f\n',iter,L)
+        if L > targetLogLikelihood || abs(pastL - L) < tol
+            break
+        else
+            pastL = L;
+        end
+
+        % MAXIMIZATION
+        N = max(N,eps);
+        ubm.ComponentProportion = max(N/sum(N),eps);
+        ubm.ComponentProportion = ubm.ComponentProportion/sum(ubm.ComponentProportion);
+        ubm.mu = bsxfun(@rdivide,F,N);
+        ubm.sigma = max(bsxfun(@rdivide,S,N) - ubm.mu.^2,eps);
+    end
+    
+    fprintf('UBM training completed in %0.2f seconds.\n',toc)
+
+end
+%%
+
+
+
+%%
+function [allFeatures, normFactors, numPar] = global_Feature_Normalization_Factors(ads, afe) 
+
+    featuresAll = {};
+    if ~isempty(ver('parallel'))
+        pool = gcp;
+        numPar = numpartitions(ads,pool);
+    else
+        numPar = 1;
+    end
+
+    parfor ii = 1:numPar
+        adsPart = partition(ads,numPar,ii);
+        featuresPart = cell(0,numel(adsPart.Files));
+        for iii = 1:numel(adsPart.Files)
+            audioData = read(adsPart);
+            featuresPart{iii} = helperFeatureExtraction(audioData,afe,[]);
+        end
+        featuresAll = [featuresAll,featuresPart];
+    end
+    allFeatures = cat(2,featuresAll{:});
+
+    normFactors.Mean = mean(allFeatures,2,'omitnan');
+    normFactors.STD = std(allFeatures,[],2,'omitnan');
+end
+
+%%
+
+
+function [afe] = feature_Extraction(fs, numCoeffs, deltaWindowLength, windowDuration, hopDuration)
+
+    windowSamples = round(windowDuration*fs);
+    hopSamples = round(hopDuration*fs);
+    overlapSamples = windowSamples - hopSamples;
+
+    afe = audioFeatureExtractor('SampleRate',fs, 'Window',hann(windowSamples,'periodic'), 'OverlapLength',overlapSamples,...
+        'mfcc',true,'mfccDelta',true, 'mfccDeltaDelta',true);
+    setExtractorParams(afe,'mfcc','DeltaWindowLength',deltaWindowLength,'NumCoeffs',numCoeffs)
+
+end 
+
+function [features,numFrames] = helperFeatureExtraction(audioData,afe,normFactors)
+    % Normalize
+    audioData = audioData/max(abs(audioData(:)));
+    
+    % Protect against NaNs
+    audioData(isnan(audioData)) = 0;
+    
+    % Isolate speech segment
+    % The dataset used in this example has one word per audioData, if more
+    % than one is speech section is detected, just use the longest
+    % detected.
+    idx = detectSpeech(audioData,afe.SampleRate);
+    if size(idx,1)>1
+        [~,seg] = max(idx(:,2) - idx(:,1));
+    else
+        seg = 1;
+    end
+    audioData = audioData(idx(seg,1):idx(seg,2));
+    
+    % Feature extraction
+    features = extract(afe,audioData);
+
+    % Feature normalization
+    if ~isempty(normFactors)
+        features = (features-normFactors.Mean')./normFactors.STD';
+    end
+    features = features';
+    
+    % Cepstral mean subtraction (for channel noise)
+    if ~isempty(normFactors)
+        features = features - mean(features,'all');
+    end
+    
+    numFrames = size(features,2);
+end
+
+
+%%%%%%%%%5
+
+function y = helperLogSumExp(x)
+    % Calculate the log-sum-exponent while avoiding overflow
+    a = max(x,[],1);
+    y = a + sum(exp(bsxfun(@minus,x,a)),1);
+end
+
+%Expectation
+function [N,F,S,L] = helperExpectation(features,gmm)
+    post = helperGMMLogLikelihood(features,gmm);
+    % Sum the likelihood over the frames
+    L = helperLogSumExp(post);
+    % Compute the sufficient statistics
+    gamma = exp(post-L)';
+
+    N = sum(gamma,1);
+    F = features * gamma;
+    S = (features.*features) * gamma;
+    L = sum(L);
+end
+
+%Maximization
+
+function gmm = helperMaximization(N,F,S)
+    N = max(N,eps);
+    gmm.ComponentProportion = max(N/sum(N),eps);
+    gmm.mu = bsxfun(@rdivide,F,N);
+    gmm.sigma = max(bsxfun(@rdivide,S,N) - gmm.mu.^2,eps);
+end
+
+%Gaussian Multi-Component Mixture Log-Likelihood
+
+function L = helperGMMLogLikelihood(x,gmm)
+    xMinusMu = repmat(x,1,1,numel(gmm.ComponentProportion)) - permute(gmm.mu,[1,3,2]);
+    permuteSigma = permute(gmm.sigma,[1,3,2]);
+    
+    Lunweighted = -0.5*(sum(log(permuteSigma),1) + sum(bsxfun(@times,xMinusMu,(bsxfun(@rdivide,xMinusMu,permuteSigma))),1) + size(gmm.mu,1)*log(2*pi));
+
+    temp = squeeze(permute(Lunweighted,[1,3,2]));
+    if size(temp,1)==1
+        % If there is only one frame, the trailing singleton dimension was
+        % removed in the permute. This accounts for that edge case
+        temp = temp';
+    end
+    L = bsxfun(@plus,temp,log(gmm.ComponentProportion)');
+end
+
+function [ads, speaker] = back_up() 
+%addpath(genpath('speech_commands_data/'));
+    %clc;
+    file_location = fullfile("speech_commands_data");
+    ads = audioDatastore(file_location, 'IncludeSubfolders',true,'LabelSource','folderNames', 'FileExtensions','.wav');
+    ads = subset(ads,ads.Labels==categorical("stop"));
+    %
+    [~,fileName] = cellfun(@(x)fileparts(x),ads.Files,'UniformOutput',false);
+    fileName = split(fileName,'_');
+    speaker = strcat('a',fileName(:,1));
+    ads.Labels = categorical(speaker);
+    
+    numSpeakersToEnroll = 10;
+    labelCount = countEachLabel(ads);
+    forEnrollAndTestSet = labelCount{:,1}(labelCount{:,2}>=3);
+    forEnroll = forEnrollAndTestSet(randi([1,numel(forEnrollAndTestSet)],numSpeakersToEnroll,1));
+    tf = ismember(ads.Labels,forEnroll);
+    adsEnrollAndValidate = subset(ads,tf);
+    adsEnroll = splitEachLabel(adsEnrollAndValidate,2);
+
+    adsTest = subset(ads,ismember(ads.Labels,forEnrollAndTestSet));
+    adsTest = subset(adsTest,~ismember(adsTest.Files,adsEnroll.Files));
+
+    forUBMTraining = ~(ismember(ads.Files,adsTest.Files) | ismember(ads.Files,adsEnroll.Files));
+    adsTrainUBM = subset(ads,forUBMTraining);
+
+    %Read from the training datastore and listen to a file. Reset the datastore.
+    [audioData,audioInfo] = read(adsTrainUBM);
+    fs = audioInfo.SampleRate;
+    t = (0:size(audioData,1)-1)/fs;
+    sound(audioData,fs)
+    figure;
+    plot(t,audioData)
+    xlabel('Time (s)')
+    ylabel('Amplitude')
+    axis([0 t(end) -1 1])
+    title('Sample Utterance from Training Set')
+    reset(adsTrainUBM)
+    
+    
+    % Features extractions
+    numCoeffs = 20;
+    deltaWindowLength = 9;
+    windowDuration = 0.025;
+    hopDuration = 0.01;
+    afe = feature_Extraction(fs, numCoeffs, deltaWindowLength, windowDuration, hopDuration);
+    
+    % Normalize the audio.
+    audioData = audioData./max(abs(audioData));
+    %figure;
+    %detectSpeech(audioData,fs);
+    
+    %Call detectSpeech again. This time, return the indices of the speech
+    %region and use them to remove nonspeech regions from the audio clip.
+    idx = detectSpeech(audioData,fs);
+    disp("idx : ")
+    disp(idx)
+    audioData = audioData(idx(1,1):idx(1,2));
+
+    %Call extract on the audioFeatureExtractor object to extract features from audio data. 
+    %The size output from extract is numHops-by-numFeatures.
+    features = extract(afe,audioData);
+    [numHops,numFeatures] = size(features)
+    
+end 
+
+
+function [train_test, evaluation] = get_index_files()
+
+train_test = ["speaker_1", "speaker_2", "speaker_3", "speaker_4", "speaker_5", ...
+              "speaker_6", "speaker_7", "speaker_8", "speaker_9", "speaker_10", ...
+              "speaker_11", "speaker_12", "speaker_13", "speaker_14", "speaker_15", ...
+              "speaker_16", "speaker_17", "speaker_18", "speaker_19", "speaker_20", ...
+              "speaker_21", "speaker_22", "speaker_23", "speaker_24", "speaker_25", ... 
+              "speaker_26", "speaker_27", "speaker_28", "speaker_29", "speaker_30", ...
+              "speaker_31", "speaker_32", "speaker_33", "speaker_34", "speaker_35", ...
+              "speaker_36", "speaker_37", "speaker_38", "speaker_39", "speaker_40", ...
+              "speaker_41", "speaker_42", "speaker_43", "speaker_44", "speaker_45", ...
+              "speaker_46", "speaker_47", "speaker_48", "speaker_49", "speaker_50", ... 
+              "speaker_51", "speaker_52", "speaker_53", "speaker_54", "speaker_55", ... 
+              "speaker_56", "speaker_57", "speaker_58", "speaker_59", "speaker_60", ... 
+              "speaker_61", "speaker_62", "speaker_63", "speaker_64", "speaker_65", ... 
+              "speaker_66", "speaker_67", "speaker_68", "speaker_69", "speaker_70", ... 
+              "speaker_71", "speaker_72", "speaker_73", "speaker_74", "speaker_75", ... 
+              "speaker_76", "speaker_77", "speaker_78", "speaker_79", "speaker_80", ... 
+              "speaker_81", "speaker_82", "speaker_83", "speaker_84", "speaker_85", ... 
+              "speaker_86", "speaker_87", "speaker_88", "speaker_89", "speaker_90", ... 
+              "speaker_91", "speaker_92", "speaker_93", "speaker_94", "speaker_95", ... 
+              "speaker_96", "speaker_97", "speaker_98", "speaker_99", "speaker_100"]; 
+evaluation = ["speaker_101", "speaker_102", "speaker_103", "speaker_104", "speaker_105", "speaker_106", "speaker_107", "speaker_108", "speaker_109", "speaker_110", "speaker_111", "speaker_112", "speaker_113", "speaker_114", "speaker_115", "speaker_116", "speaker_117", "speaker_118", "speaker_119", "speaker_120", "speaker_121", "speaker_122"];
+
+end
